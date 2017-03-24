@@ -1,15 +1,37 @@
 package com.stlabs.eventsourced.core
 
-import akka.actor.{Actor, ActorRef}
+import akka.actor._
+import akka.pattern.ask
 import akka.util.Timeout
+import com.stlabs.eventsourced.core.Message._
+
 import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Future}
 
 /**
   * A communication channel used by an event-sourced Component to interact with
   * its environment. A channel is used to communicate via event messages.
   */
 trait Channel extends Actor {
+  import Journaler._
 
+  def id: Int
+  def componentId: Int
+
+  implicit val executionContext = ExecutionContext.fromExecutor(context.dispatcher)
+
+  def journaler: ActorRef
+  val journalerTimeout = Timeout(10 seconds)
+
+  var counter = 0L
+
+  def journal(cmd: Any): Future[Any] =
+    journaler.ask(cmd)(journalerTimeout)
+
+  def lastSequenceNr: Long = {
+    val future = journaler.ask(GetLastSequenceNr(componentId, id))(journalerTimeout).mapTo[Long]
+    Await.result(future, journalerTimeout.duration)
+  }
 }
 
 object Channel {
@@ -29,19 +51,71 @@ object Channel {
   * @param journaler
   */
 class InputChannel(val componentId: Int, val journaler: ActorRef) extends Channel {
+  import Channel._
+  import Journaler._
 
-  def receive = ???
+  val id = inputChannelId
 
+  var sequencer: Option[ActorRef] = None
+  var processor: Option[ActorRef] = None
+
+  def receive = {
+    case Message(evt, sdr, sdrmid, _, _, _, false) => {
+      val msg = Message(evt, sdr, sdrmid, counter, Nil, Nil)
+      val key = Key(componentId, id, msg.sequenceNr, 0)
+
+      val future = journal(WriteMsg(key, msg))
+
+      val s = sender
+
+      future.onSuccess {
+        case _ => { sequencer.foreach(_ ! (msg.sequenceNr, msg)); s ! key }
+      }
+
+      future.onFailure {
+        case e => { context.stop(self); println("journaling failure: %s caused by %s" format (e, msg)) }
+        // TODO: inform cluster manager to fail-over
+      }
+
+      counter = counter + 1
+    }
+    case msg @ Message(_, _, _, _, _, _, true) => {
+      processor.foreach(_.!(msg.copy(sender = None))(null))
+    }
+    case cmd @ SetProcessor(p) => {
+      sequencer.foreach(_ forward cmd)
+      processor = Some(p)
+    }
+  }
+
+  override def preStart() {
+    val lsn = lastSequenceNr
+    val seq = context.actorOf(Props(new InputChannelSequencer(lsn)))
+    sequencer = Some(seq)
+    counter = lsn + 1
+  }
 }
 
 private class InputChannelSequencer(val lastSequenceNr: Long) extends Sequencer {
+  import Channel._
 
-  def receive = ???
+  var processor: Option[ActorRef] = None
 
+  def receiveSequenced = {
+    case msg: Message => {
+      processor.foreach(_ ! msg)
+    }
+    case SetProcessor(p) => {
+      processor = Some(p)
+    }
+  }
 }
 
 class InputChannelProducer(inputChannel: ActorRef) extends Actor {
-  def receive = ???
+  def receive = {
+    case msg: Message => inputChannel.!(msg.copy(sender = Some(sender)))(null)
+    case evt          => inputChannel.!(Message(evt, Some(sender)))(null)
+  }
 }
 
 /**
@@ -49,7 +123,7 @@ class InputChannelProducer(inputChannel: ActorRef) extends Actor {
   * to it's environment (or even to the component it is owned by).
   */
 trait OutputChannel extends Channel {
-
+  var destination: Option[ActorRef] = None
 }
 
 /**
@@ -61,7 +135,30 @@ trait OutputChannel extends Channel {
   * @param journaler
   */
 class DefaultOutputChannel(val componentId: Int, val id: Int, val journaler: ActorRef) extends OutputChannel {
-  def receive = ???
+  import Channel._
+  import Journaler._
+  import Message._
+
+  assert(id > 0)
+
+  def receive = {
+    case Message(evt, sdr, sdrmid, seqnr, acks, _, replicated) if (!acks.contains(id) && !replicated) => {
+      val msg = Message(evt, sdr, sdrmid, counter, Nil, Nil)
+
+      destination.foreach(_.ask(msg)(destinationTimeout) onSuccess {
+        case r => journaler.!(WriteAck(Key(componentId, inputChannelId, seqnr, id)))(null)
+      })
+
+      counter = counter + 1
+    }
+    case SetDestination(d) => {
+      destination = Some(d)
+    }
+  }
+
+  override def preStart() {
+    counter = 1L
+  }
 }
 
 /**
@@ -74,9 +171,71 @@ class DefaultOutputChannel(val componentId: Int, val id: Int, val journaler: Act
   * @param journaler
   */
 class ReliableOutputChannel(val componentId: Int, val id: Int, val journaler: ActorRef) extends OutputChannel {
-  def receive = ???
+  import Channel._
+  import Journaler._
+  import Message._
+
+  assert(id > 0)
+
+  var sequencer: Option[ActorRef] = None
+
+  def receive = {
+    case Message(evt, sdr, sdrmid, seqnr, acks, _, replicated)  if (!acks.contains(id) && !replicated) => {
+      val msg = Message(evt, sdr, sdrmid, counter, Nil, Nil)
+      val msgKey = Key(componentId, id, msg.sequenceNr, 0)
+      val ackKey = Key(componentId, inputChannelId, seqnr, id)
+
+      val future = journal(WriteAckAndMsg(ackKey, msgKey, msg))
+
+      future.onSuccess {
+        case _ => sequencer.foreach(_ ! (msg.sequenceNr, msg))
+      }
+
+      future.onFailure {
+        case e => { context.stop(self); println("journaling failure: %s caused by %s" format (e, msg)) }
+        // TODO: inform cluster manager to fail-over
+      }
+
+      counter = counter + 1
+    }
+    case cmd @ SetDestination(d) => {
+      sequencer.foreach(_ forward cmd)
+      destination = Some(d)
+    }
+  }
+
+  override def preStart() {
+    val lsn = lastSequenceNr
+    val seq = context.actorOf(Props(new ReliableOutputChannelSequencer(componentId, id, journaler, lsn)))
+    sequencer = Some(seq)
+    counter = lsn + 1
+  }
 }
 
 class ReliableOutputChannelSequencer(componentId: Int, id: Int, journaler: ActorRef, val lastSequenceNr: Long) extends Sequencer {
-  def receive = ???
+  import Channel._
+  import Journaler._
+
+  implicit val executionContext = ExecutionContext.fromExecutor(context.dispatcher)
+
+  var destination: Option[ActorRef] = None
+
+  def receiveSequenced = {
+    case msg: Message => {
+      destination.foreach { d =>
+        val future = d.ask(msg)(destinationTimeout)
+
+        future.onSuccess {
+          case _ => journaler.!(DeleteMsg(Key(componentId, id, msg.sequenceNr, 0)))(null)
+        }
+
+        future.onFailure {
+          case _ => // TODO: stop self and schedule retry
+        }
+      }
+    }
+    case SetDestination(d) => {
+      destination = Some(d)
+    }
+  }
 }

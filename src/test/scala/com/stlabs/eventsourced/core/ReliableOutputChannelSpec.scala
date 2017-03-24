@@ -34,7 +34,7 @@ class ReliableOutputChannelSpec extends WordSpec with MustMatchers with BeforeAn
 
     "delivering output messages" must {
       "recover from destination failures" in {
-        
+
       }
     }
   }
