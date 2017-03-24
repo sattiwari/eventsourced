@@ -20,7 +20,7 @@ class Example extends WordSpec with MustMatchers with BeforeAndAfterEach with Be
   val journalDir1 = new File("target/journal-1")
   val journalDir2 = new File("target/journal-2")
 
-  override protected def beforeEach() {
+  override protected def afterEach() {
     FileUtils.deleteDirectory(journalDir1)
     FileUtils.deleteDirectory(journalDir2)
   }
@@ -50,9 +50,9 @@ class Example extends WordSpec with MustMatchers with BeforeAndAfterEach with Be
       Await.result(response, timeout.duration) must be("a-1-1")
 
       // create a fresh component and recover state
-      component = createExampleComponent(destination)
-      Await.result(component.replay(), timeout.duration)
-
+//      component = createExampleComponent(destination)
+//      Await.result(component.replay(), timeout.duration)
+//
       // run again (different output as it depends on component state)
       component.producer ! "a"
       result = exchanger.exchange(null)

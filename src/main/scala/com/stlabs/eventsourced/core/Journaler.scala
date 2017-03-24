@@ -12,7 +12,7 @@ import org.iq80.leveldb._
 import scala.concurrent.duration._
 import Message._
 
-import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.{Future, Promise}
 
 class Journaler(dir: File) extends Actor {
   import Journaler._
@@ -177,38 +177,37 @@ class ReplicatingJournaler(dir: File) extends Actor {
       journaler forward cmd
     }
     case cmd => {
-//      val f1 = journaler.ask(cmd)(journalerTimeout)
-//      val f2 = if (replicator.isDefined) replicator.get.ask(cmd)(replicatorTimeout) else Promise.successful(())
-//      val f3 = Future.sequence(List(f1, f2))
-//
-//      val s = sender
-//
-//      f3 onSuccess {
-//        case r => s ! r
-//      }
-//
-//      f3 onFailure {
-//        case e => {
-//          val f1Success = f1.value.map(_.isRight).getOrElse(false)
-//          val f2Success = f2.value.map(_.isRight).getOrElse(false)
-//          (f1Success, f2Success) match {
-//            case (true, false) => {
-//              // continue at risk without replication
-//              self ! SetReplicator(None)
-//
-//              // inform sender about journaling result
-//              s ! f1.value.get.right.get
-//
-//              // TODO: inform cluster manager to re-attach slave
-//              // ...
-//            }
-//            case other => {
-//              sender ! Status.Failure(e)
-//            }
-//          }
-//        }
-//      }
-      ???
+      val f1: Future[Any] = journaler.ask(cmd)(journalerTimeout)
+      val f2: Future[Any] = if (replicator.isDefined) replicator.get.ask(cmd)(replicatorTimeout) else Promise.successful(()).future
+      val f3: Future[List[Any]] = Future.sequence(List(f1, f2))
+
+      val s = sender
+
+      f3 onSuccess {
+        case r => s ! r
+      }
+
+      f3 onFailure {
+        case e => {
+          val f1Success = f1.value.map(_.isSuccess).getOrElse(false)
+          val f2Success = f2.value.map(_.isSuccess).getOrElse(false)
+          (f1Success, f2Success) match {
+            case (true, false) => {
+              // continue at risk without replication
+              self ! SetReplicator(None)
+
+              // inform sender about journaling result
+              s ! f1.value.get.isSuccess
+
+              // TODO: inform cluster manager to re-attach slave
+              // ...
+            }
+            case other => {
+              sender ! Status.Failure(e)
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -217,6 +216,7 @@ class Replicator(journaler: ActorRef) extends Actor {
   import Journaler._
   import Replicator._
 
+  implicit val executor = context.dispatcher
   var inputChannels = Map.empty[Int, ActorRef] // componentId -> inputChannel
 
   def receive = {
